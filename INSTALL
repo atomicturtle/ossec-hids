@@ -16,19 +16,31 @@ in the install.sh script). I REALLY recommend EVERYONE to use the
 FAST WAY! Only developers or experienced people should use the
 other methods.
 
+
 Before running the script, make sure your system has the necessary
-libraries and tools installed:
+dependencies installed:
+
+*Rocky/Redhat/Fedora*
+
+- openssl-devel
+- pcre2-devel
+- zlib-devel
+- make, gcc
+- systemd-devel
+
+dnf -y install openssl-devel pcre2-devel zlib-devel make gcc systemd-devel
+
+*Ubuntu/Debian*
+
 - libssl
 - libpcre2
 - libz
 - make, gcc
 - libsystemd-dev
 
-On a Ubuntu/Debian system, these can be installed with:
-
 apt install libz-dev libssl-dev libpcre2-dev build-essential libsystemd-dev
 
-Fast way steps:
+Quickstart
 
 1- Run the script ./install.sh. It will guide you through the 
    installation process.
@@ -50,7 +62,7 @@ Fast way steps:
 = Installation and Running (99.99% should read ABOVE) =
 
 
-By Hand Installation steps:
+Manual Installation steps:
 
 1- Create the necessary directories (by default /var/ossec).
 2- Move the necessary files to the ossec directory.
