@@ -19,6 +19,11 @@
 #include <libgen.h>
 #else
 #include <aclapi.h>
+#include <windows.h>
+#include <winbase.h>
+#include <winreg.h>
+#include <sysinfoapi.h>
+#include <versionhelpers.h>
 #endif
 
 /* Vista product information */
@@ -295,6 +300,54 @@
 #ifndef PRODUCT_WEB_SERVER_CORE_C
 #define PRODUCT_WEB_SERVER_CORE_C "Web Server Edition "
 #endif
+
+/* Windows 10/11 specific constants */
+#ifndef MOVEFILE_REPLACE_EXISTING
+#define MOVEFILE_REPLACE_EXISTING 0x00000001
+#endif
+
+#ifndef MOVEFILE_WRITE_THROUGH
+#define MOVEFILE_WRITE_THROUGH 0x00000008
+#endif
+
+/* Windows types if not already defined */
+#ifndef DWORD
+typedef unsigned long DWORD;
+#endif
+
+#ifndef HANDLE
+typedef void* HANDLE;
+#endif
+
+#ifndef PACL
+typedef struct _ACL* PACL;
+#endif
+
+#ifndef PSECURITY_DESCRIPTOR
+typedef struct _SECURITY_DESCRIPTOR* PSECURITY_DESCRIPTOR;
+#endif
+
+#ifndef EXPLICIT_ACCESS
+typedef struct _EXPLICIT_ACCESS {
+    DWORD grfAccessPermissions;
+    DWORD grfAccessMode;
+    DWORD grfInheritance;
+    struct _TRUSTEE Trustee;
+} EXPLICIT_ACCESS, *PEXPLICIT_ACCESS;
+#endif
+
+#ifndef SECURITY_ATTRIBUTES
+typedef struct _SECURITY_ATTRIBUTES {
+    DWORD nLength;
+    void* lpSecurityDescriptor;
+    int bInheritHandle;
+} SECURITY_ATTRIBUTES, *PSECURITY_ATTRIBUTES;
+#endif
+
+#ifndef PSID
+typedef void* PSID;
+#endif
+
 #endif /* WIN32 */
 
 #ifdef WIN32
@@ -841,7 +894,12 @@ int checkVista()
             strstr(m_uname, "Vista") ||
             strstr(m_uname, "Windows 7") ||
             strstr(m_uname, "Windows 8") ||
-            strstr(m_uname, "Windows Server 2012")) {
+            strstr(m_uname, "Windows Server 2012") ||
+            strstr(m_uname, "Windows 10") ||
+            strstr(m_uname, "Windows 11") ||
+            strstr(m_uname, "Windows Server 2016") ||
+            strstr(m_uname, "Windows Server 2019") ||
+            strstr(m_uname, "Windows Server 2022")) {
         isVista = 1;
         verbose("%s: INFO: System is Vista or newer (%s).",
                 __local_name, m_uname);
@@ -1148,7 +1206,161 @@ char *getuname()
     switch (osvi.dwPlatformId) {
         /* Test for the Windows NT product family */
         case VER_PLATFORM_WIN32_NT:
-            if (osvi.dwMajorVersion == 6) {
+            if (osvi.dwMajorVersion == 10) {
+                if (osvi.dwMinorVersion == 0) {
+                    /* Get product version for Windows 10/11 and Server 2016/2019/2022 */
+                    pGPI = (PGPI) GetProcAddress(
+                               GetModuleHandle(TEXT("kernel32.dll")),
+                               "GetProductInfo");
+
+                    if (pGPI) {
+                        pGPI(10, 0, 0, 0, &dwType);
+                    }
+
+                    if (osvi.wProductType == VER_NT_WORKSTATION) {
+                        /* Windows 10/11 detection based on build number */
+                        if (osvi.dwBuildNumber >= 22000) {
+                            strncat(ret, "Microsoft Windows 11 ", ret_size - 1);
+                        } else {
+                            strncat(ret, "Microsoft Windows 10 ", ret_size - 1);
+                        }
+                    } else {
+                        /* Windows Server 2016/2019/2022 detection based on build number */
+                        if (osvi.dwBuildNumber >= 20348) {
+                            strncat(ret, "Microsoft Windows Server 2022 ", ret_size - 1);
+                        } else if (osvi.dwBuildNumber >= 17763) {
+                            strncat(ret, "Microsoft Windows Server 2019 ", ret_size - 1);
+                        } else {
+                            strncat(ret, "Microsoft Windows Server 2016 ", ret_size - 1);
+                        }
+                    }
+
+                    ret_size -= strlen(ret) + 1;
+
+                    /* Add product edition information */
+                    switch (dwType) {
+                        case PRODUCT_UNLICENSED:
+                            strncat(ret, PRODUCT_UNLICENSED_C, ret_size - 1);
+                            break;
+                        case PRODUCT_BUSINESS:
+                            strncat(ret, PRODUCT_BUSINESS_C, ret_size - 1);
+                            break;
+                        case PRODUCT_BUSINESS_N:
+                            strncat(ret, PRODUCT_BUSINESS_N_C, ret_size - 1);
+                            break;
+                        case PRODUCT_CLUSTER_SERVER:
+                            strncat(ret, PRODUCT_CLUSTER_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_DATACENTER_SERVER:
+                            strncat(ret, PRODUCT_DATACENTER_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_DATACENTER_SERVER_CORE:
+                            strncat(ret, PRODUCT_DATACENTER_SERVER_CORE_C, ret_size - 1);
+                            break;
+                        case PRODUCT_DATACENTER_SERVER_CORE_V:
+                            strncat(ret, PRODUCT_DATACENTER_SERVER_CORE_V_C, ret_size - 1);
+                            break;
+                        case PRODUCT_DATACENTER_SERVER_V:
+                            strncat(ret, PRODUCT_DATACENTER_SERVER_V_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE:
+                            strncat(ret, PRODUCT_ENTERPRISE_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE_N:
+                            strncat(ret, PRODUCT_ENTERPRISE_N_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE_SERVER:
+                            strncat(ret, PRODUCT_ENTERPRISE_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE_SERVER_CORE:
+                            strncat(ret, PRODUCT_ENTERPRISE_SERVER_CORE_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE_SERVER_CORE_V:
+                            strncat(ret, PRODUCT_ENTERPRISE_SERVER_CORE_V_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE_SERVER_IA64:
+                            strncat(ret, PRODUCT_ENTERPRISE_SERVER_IA64_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ENTERPRISE_SERVER_V:
+                            strncat(ret, PRODUCT_ENTERPRISE_SERVER_V_C, ret_size - 1);
+                            break;
+                        case PRODUCT_HOME_BASIC:
+                            strncat(ret, PRODUCT_HOME_BASIC_C, ret_size - 1);
+                            break;
+                        case PRODUCT_HOME_BASIC_N:
+                            strncat(ret, PRODUCT_HOME_BASIC_N_C, ret_size - 1);
+                            break;
+                        case PRODUCT_HOME_PREMIUM:
+                            strncat(ret, PRODUCT_HOME_PREMIUM_C, ret_size - 1);
+                            break;
+                        case PRODUCT_HOME_PREMIUM_N:
+                            strncat(ret, PRODUCT_HOME_PREMIUM_N_C, ret_size - 1);
+                            break;
+                        case PRODUCT_HOME_SERVER:
+                            strncat(ret, PRODUCT_HOME_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_MEDIUMBUSINESS_SERVER_MANAGEMENT:
+                            strncat(ret, PRODUCT_MEDIUMBUSINESS_SERVER_MANAGEMENT_C, ret_size - 1);
+                            break;
+                        case PRODUCT_MEDIUMBUSINESS_SERVER_MESSAGING:
+                            strncat(ret, PRODUCT_MEDIUMBUSINESS_SERVER_MESSAGING_C, ret_size - 1);
+                            break;
+                        case PRODUCT_MEDIUMBUSINESS_SERVER_SECURITY:
+                            strncat(ret, PRODUCT_MEDIUMBUSINESS_SERVER_SECURITY_C, ret_size - 1);
+                            break;
+                        case PRODUCT_SERVER_FOR_SMALLBUSINESS:
+                            strncat(ret, PRODUCT_SERVER_FOR_SMALLBUSINESS_C, ret_size - 1);
+                            break;
+                        case PRODUCT_SMALLBUSINESS_SERVER:
+                            strncat(ret, PRODUCT_SMALLBUSINESS_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_SMALLBUSINESS_SERVER_PREMIUM:
+                            strncat(ret, PRODUCT_SMALLBUSINESS_SERVER_PREMIUM_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STANDARD_SERVER:
+                            strncat(ret, PRODUCT_STANDARD_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STANDARD_SERVER_CORE:
+                            strncat(ret, PRODUCT_STANDARD_SERVER_CORE_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STANDARD_SERVER_CORE_V:
+                            strncat(ret, PRODUCT_STANDARD_SERVER_CORE_V_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STANDARD_SERVER_V:
+                            strncat(ret, PRODUCT_STANDARD_SERVER_V_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STARTER:
+                            strncat(ret, PRODUCT_STARTER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STORAGE_ENTERPRISE_SERVER:
+                            strncat(ret, PRODUCT_STORAGE_ENTERPRISE_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STORAGE_EXPRESS_SERVER:
+                            strncat(ret, PRODUCT_STORAGE_EXPRESS_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STORAGE_STANDARD_SERVER:
+                            strncat(ret, PRODUCT_STORAGE_STANDARD_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_STORAGE_WORKGROUP_SERVER:
+                            strncat(ret, PRODUCT_STORAGE_WORKGROUP_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ULTIMATE:
+                            strncat(ret, PRODUCT_ULTIMATE_C, ret_size - 1);
+                            break;
+                        case PRODUCT_ULTIMATE_N:
+                            strncat(ret, PRODUCT_ULTIMATE_N_C, ret_size - 1);
+                            break;
+                        case PRODUCT_WEB_SERVER:
+                            strncat(ret, PRODUCT_WEB_SERVER_C, ret_size - 1);
+                            break;
+                        case PRODUCT_WEB_SERVER_CORE:
+                            strncat(ret, PRODUCT_WEB_SERVER_CORE_C, ret_size - 1);
+                            break;
+                    }
+
+                    ret_size -= strlen(ret) + 1;
+                }
+            } else if (osvi.dwMajorVersion == 6) {
                 if (osvi.dwMinorVersion == 0) {
                     if (osvi.wProductType == VER_NT_WORKSTATION ) {
                         strncat(ret, "Microsoft Windows Vista ", ret_size - 1);
@@ -1536,7 +1748,6 @@ char *getuname()
     strncat(ret, os_v, ret_size - 1);
 
     return (ret);
-
 }
 
 #endif /* WIN32 */
