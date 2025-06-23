@@ -13,6 +13,9 @@
 #include <errno.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "shared.h"
 
 #ifndef WIN32
@@ -25,6 +28,12 @@
 #include <sysinfoapi.h>
 #include <versionhelpers.h>
 #endif
+
+/* Function declarations for Linux detection */
+static char* read_line_from_file(const char* filename);
+static char* get_value_from_key_value(const char* line, const char* key);
+static char* detect_linux_distribution(void);
+static char* detect_container_environment(void);
 
 /* Vista product information */
 #ifdef WIN32
@@ -757,26 +766,65 @@ int mkstemp_ex(char *tmp_path)
 char *getuname()
 {
     struct utsname uts_buf;
+    char *ret = NULL;
+    char *distro_info = NULL;
+    char *container_info = NULL;
 
     if (uname(&uts_buf) >= 0) {
-        char *ret;
-
-        ret = (char *) calloc(512, sizeof(char));
+        ret = (char *) calloc(1024, sizeof(char));
         if (ret == NULL) {
             return (NULL);
         }
 
-        snprintf(ret, 511, "%s %s %s %s %s - %s %s",
-                 uts_buf.sysname,
-                 uts_buf.nodename,
-                 uts_buf.release,
-                 uts_buf.version,
-                 uts_buf.machine,
-                 __ossec_name, __ossec_version);
+        /* Get distribution information for Linux */
+        if (strcmp(uts_buf.sysname, "Linux") == 0) {
+            distro_info = detect_linux_distribution();
+            container_info = detect_container_environment();
+            
+            if (distro_info) {
+                if (container_info) {
+                    snprintf(ret, 1023, "%s (%s) %s %s %s - %s %s",
+                             distro_info, container_info,
+                             uts_buf.nodename,
+                             uts_buf.release,
+                             uts_buf.machine,
+                             __ossec_name, __ossec_version);
+                } else {
+                    snprintf(ret, 1023, "%s %s %s %s %s - %s %s",
+                             distro_info,
+                             uts_buf.nodename,
+                             uts_buf.release,
+                             uts_buf.version,
+                             uts_buf.machine,
+                             __ossec_name, __ossec_version);
+                }
+            } else {
+                /* Fallback to original format if no distribution info */
+                snprintf(ret, 1023, "%s %s %s %s %s - %s %s",
+                         uts_buf.sysname,
+                         uts_buf.nodename,
+                         uts_buf.release,
+                         uts_buf.version,
+                         uts_buf.machine,
+                         __ossec_name, __ossec_version);
+            }
+        } else {
+            /* Non-Linux systems use original format */
+            snprintf(ret, 1023, "%s %s %s %s %s - %s %s",
+                     uts_buf.sysname,
+                     uts_buf.nodename,
+                     uts_buf.release,
+                     uts_buf.version,
+                     uts_buf.machine,
+                     __ossec_name, __ossec_version);
+        }
+
+        /* Clean up */
+        if (distro_info) free(distro_info);
+        if (container_info) free(container_info);
 
         return (ret);
     } else {
-        char *ret;
         ret = (char *) calloc(512, sizeof(char));
         if (ret == NULL) {
             return (NULL);
@@ -1812,4 +1860,185 @@ void remove_control_characters(char *str) {
     }
 
     str[j] = '\0'; // Null-terminate the string after removing control characters
+}
+
+/* Helper function to read a line from a file */
+static char* read_line_from_file(const char* filename) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        return NULL;
+    }
+    
+    char* line = NULL;
+    size_t len = 0;
+    ssize_t read = getline(&line, &len, file);
+    fclose(file);
+    
+    if (read == -1) {
+        free(line);
+        return NULL;
+    }
+    
+    /* Remove newline */
+    if (line[read - 1] == '\n') {
+        line[read - 1] = '\0';
+    }
+    
+    return line;
+}
+
+/* Helper function to get value from key=value format */
+static char* get_value_from_key_value(const char* line, const char* key) {
+    char* key_pattern = malloc(strlen(key) + 3);
+    if (!key_pattern) {
+        return NULL;
+    }
+    
+    snprintf(key_pattern, strlen(key) + 3, "%s=", key);
+    
+    if (strncmp(line, key_pattern, strlen(key_pattern)) == 0) {
+        free(key_pattern);
+        char* value = strdup(line + strlen(key_pattern));
+        /* Remove quotes if present */
+        if (value[0] == '"') {
+            char* end_quote = strrchr(value, '"');
+            if (end_quote && end_quote != value) {
+                *end_quote = '\0';
+                memmove(value, value + 1, strlen(value));
+            }
+        }
+        return value;
+    }
+    
+    free(key_pattern);
+    return NULL;
+}
+
+/* Detect Linux distribution using /etc/os-release */
+static char* detect_linux_distribution() {
+    char* distro_info = NULL;
+    char* pretty_name = NULL;
+    char* name = NULL;
+    char* version = NULL;
+    
+    /* Try /etc/os-release first (modern standard) */
+    FILE* os_release = fopen("/etc/os-release", "r");
+    if (os_release) {
+        char line[256];
+        while (fgets(line, sizeof(line), os_release)) {
+            /* Remove newline */
+            line[strcspn(line, "\n")] = 0;
+            
+            if (!pretty_name) {
+                pretty_name = get_value_from_key_value(line, "PRETTY_NAME");
+            }
+            if (!name) {
+                name = get_value_from_key_value(line, "NAME");
+            }
+            if (!version) {
+                version = get_value_from_key_value(line, "VERSION");
+            }
+        }
+        fclose(os_release);
+        
+        if (pretty_name) {
+            distro_info = strdup(pretty_name);
+        } else if (name && version) {
+            distro_info = malloc(strlen(name) + strlen(version) + 2);
+            if (distro_info) {
+                snprintf(distro_info, strlen(name) + strlen(version) + 2, "%s %s", name, version);
+            }
+        } else if (name) {
+            distro_info = strdup(name);
+        }
+    }
+    
+    /* Fallback to legacy files if /etc/os-release not available */
+    if (!distro_info) {
+        /* Try /etc/redhat-release */
+        char* redhat_release = read_line_from_file("/etc/redhat-release");
+        if (redhat_release) {
+            distro_info = redhat_release;
+        } else {
+            /* Try /etc/debian_version */
+            char* debian_version = read_line_from_file("/etc/debian_version");
+            if (debian_version) {
+                distro_info = malloc(strlen("Debian ") + strlen(debian_version) + 1);
+                if (distro_info) {
+                    snprintf(distro_info, strlen("Debian ") + strlen(debian_version) + 1, "Debian %s", debian_version);
+                }
+                free(debian_version);
+            } else {
+                /* Try /etc/SuSE-release */
+                char* suse_release = read_line_from_file("/etc/SuSE-release");
+                if (suse_release) {
+                    distro_info = suse_release;
+                } else {
+                    /* Try /etc/alpine-release */
+                    char* alpine_release = read_line_from_file("/etc/alpine-release");
+                    if (alpine_release) {
+                        distro_info = malloc(strlen("Alpine Linux ") + strlen(alpine_release) + 1);
+                        if (distro_info) {
+                            snprintf(distro_info, strlen("Alpine Linux ") + strlen(alpine_release) + 1, "Alpine Linux %s", alpine_release);
+                        }
+                        free(alpine_release);
+                    } else {
+                        /* Try /etc/gentoo-release */
+                        char* gentoo_release = read_line_from_file("/etc/gentoo-release");
+                        if (gentoo_release) {
+                            distro_info = gentoo_release;
+                        } else {
+                            /* Try /etc/slackware-version */
+                            char* slackware_version = read_line_from_file("/etc/slackware-version");
+                            if (slackware_version) {
+                                distro_info = slackware_version;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /* Clean up */
+    if (pretty_name) free(pretty_name);
+    if (name) free(name);
+    if (version) free(version);
+    
+    return distro_info;
+}
+
+/* Detect container/cloud environment */
+static char* detect_container_environment() {
+    /* Check for Docker */
+    if (access("/.dockerenv", F_OK) == 0) {
+        return strdup("Docker");
+    }
+    
+    /* Check for Kubernetes */
+    if (access("/var/run/secrets/kubernetes.io", F_OK) == 0) {
+        return strdup("Kubernetes");
+    }
+    
+    /* Check for LXC/LXD */
+    if (access("/proc/1/environ", F_OK) == 0) {
+        FILE* environ = fopen("/proc/1/environ", "r");
+        if (environ) {
+            char line[1024];
+            while (fgets(line, sizeof(line), environ)) {
+                if (strstr(line, "container=lxc") || strstr(line, "container=lxd")) {
+                    fclose(environ);
+                    return strdup("LXC/LXD");
+                }
+            }
+            fclose(environ);
+        }
+    }
+    
+    /* Check for systemd-nspawn */
+    if (access("/etc/systemd/nspawn", F_OK) == 0) {
+        return strdup("systemd-nspawn");
+    }
+    
+    return NULL;
 }
