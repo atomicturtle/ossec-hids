@@ -1,121 +1,91 @@
-/* Copyright (C) 2009 Trend Micro Inc.
- * All right reserved.
+/* Copyright (C) 2026 Atomicorp, Inc.
+ * All rights reserved.
  *
  * This program is a free software; you can redistribute it
  * and/or modify it under the terms of the GNU General Public
  * License (version 2) as published by the FSF - Free Software
- * Foundation
+ * Foundation.
  */
 
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-
 #include "os_regex.h"
-#include "os_regex_internal.h"
 
-/* Algorithm:
- *       Go as fast as you can :)
- *
- * Supports:
- *      '|' to separate multiple OR patterns
- *      '^' to match the beginning of a string
- */
+#ifndef WIN32
+static __thread regex_matching *os_regex_tls_match = NULL;
+#else
+static regex_matching *os_regex_tls_match = NULL;
+#endif
 
-/* Prototypes */
-static int _InternalMatch(const char *pattern, const char *str, size_t count) __attribute__((nonnull));
-
-
-/* Search for pattern in the string */
-int OS_WordMatch(const char *pattern, const char *str)
+void regex_matching_clear(regex_matching *match)
 {
-    size_t count = 0;
+    int i;
 
-    if (*pattern == '\0') {
-        return (FALSE);
+    if (!match) {
+        return;
     }
 
-    do {
-        if (pattern[count] == '|') {
-            /* If we match '|' , search with
-             * we have so far.
-             */
-            if (_InternalMatch(pattern, str, count)) {
-                return (TRUE);
-            } else {
-                pattern += count + 1;
-                count = 0;
-                continue;
-            }
-        }
-
-        count++;
-
-    } while (pattern[count] != '\0');
-
-    /* Last check until end of string */
-    return (_InternalMatch(pattern, str, count));
+    for (i = 0; i < REGEX_MATCH_MAX_GROUPS && match->sub_strings[i]; i++) {
+        free(match->sub_strings[i]);
+        match->sub_strings[i] = NULL;
+    }
 }
 
-static int _InternalMatch(const char *pattern, const char *str, size_t pattern_size)
+void regex_matching_free_match_data(regex_matching *match)
 {
-    const uchar *pt = (const uchar *)pattern;
-    const uchar *st = (const uchar *)str;
-    const uchar last_char = (const uchar) pattern[pattern_size];
-
-    if (*pattern == '\0') {
-        return (TRUE);
+    if (!match || !match->match_data) {
+        return;
     }
 
-    /* If '^' specified, just do a strncasecmp */
-    else if (*pattern == '^') {
-        pattern++;
-        pattern_size --;
-
-        /* Compare two strings */
-        if (strncasecmp(pattern, str, pattern_size) == 0) {
-            return (TRUE);
-        }
-        return (FALSE);
-    }
-
-    /* Null line */
-    else if (*st == '\0') {
-        return (FALSE);
-    }
-
-    /* Look to match the first pattern */
-    do {
-        /* Match */
-        if (charmap[*st] == charmap[*pt]) {
-            str = (const char *)st++;
-            pt++;
-
-            while (*pt != last_char) {
-                if (*st == '\0') {
-                    return (FALSE);
-                }
-
-                else if (charmap[*pt] != charmap[*st]) {
-                    goto error;
-                }
-
-                st++;
-                pt++;
-            }
-
-            /* Return here if pt == last_char */
-            return (TRUE);
-
-error:
-            st = (const uchar *)str;
-            pt = (const uchar *)pattern;
-        }
-
-        st++;
-    } while (*st != '\0');
-
-    return (FALSE);
+    pcre2_match_data_free(match->match_data);
+    match->match_data = NULL;
 }
 
+pcre2_match_data *regex_matching_get_match_data(regex_matching *match, const pcre2_code *code)
+{
+    (void)code;
+
+    if (!match) {
+        return NULL;
+    }
+
+    /* Fixed ovector size so one thread-owned buffer works for any pattern. */
+    if (!match->match_data) {
+        match->match_data = pcre2_match_data_create(REGEX_MATCH_MAX_GROUPS + 1, NULL);
+    }
+
+    return match->match_data;
+}
+
+void os_regex_set_thread_match(regex_matching *match)
+{
+    os_regex_tls_match = match;
+}
+
+regex_matching *os_regex_get_thread_match(void)
+{
+    return os_regex_tls_match;
+}
+
+char **os_regex_get_substring_buffer(OSRegex *reg)
+{
+    regex_matching *match = os_regex_get_thread_match();
+
+    if (match) {
+        regex_matching_clear(match);
+        return match->sub_strings;
+    }
+
+    return reg->sub_strings;
+}
+
+char **ospcre2_get_substring_buffer(OSPcre2 *reg)
+{
+    regex_matching *match = os_regex_get_thread_match();
+
+    if (match) {
+        regex_matching_clear(match);
+        return match->sub_strings;
+    }
+
+    return reg->sub_strings;
+}

@@ -1358,6 +1358,22 @@ test_coverage: build_tests
 	genhtml --branch-coverage --output-directory coverage-report/ --title "ossec test coverage" --show-details --legend --num-spaces 4 --quiet ossec.test
 
 ####################
+#### regression ####
+####################
+
+# Pipeline / analysisd regressions + shared queue/thread tests.
+# Requires a prior server (or hybrid) build so *-live.o and libs exist.
+.PHONY: regression regression-clean
+
+regression:
+	${MAKE} -C shared/tests check
+	${MAKE} -f tests/regressions/Makefile check
+
+regression-clean:
+	${MAKE} -C shared/tests clean
+	${MAKE} -f tests/regressions/Makefile clean
+
+####################
 #### RUule Tests ###
 ####################
 
