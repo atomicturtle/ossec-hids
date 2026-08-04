@@ -22,6 +22,16 @@ The current stable releases are available on the ossec website.
 * Releases can be downloaded from: [Downloads](https://www.ossec.net/downloads/)
 * Release documentation is available at: [docs](https://www.ossec.net/docs/)
 
+Convenience links that always point at the current stable tag (`latest` is a
+floating tag moved on each release):
+
+* Source tarball: https://github.com/ossec/ossec-hids/archive/latest.tar.gz
+* Source zip: https://github.com/ossec/ossec-hids/archive/latest.zip
+
+For GPG-verified installs, use the versioned artifacts and signatures on the
+[GitHub Releases](https://github.com/ossec/ossec-hids/releases) page instead of
+the floating `latest` archives.
+
 
 ## Development ##
 
