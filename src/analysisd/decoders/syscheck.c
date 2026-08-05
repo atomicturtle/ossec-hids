@@ -927,10 +927,12 @@ static int DB_Search(const char *f_name, const char *c_sum, Eventinfo *lf)
     fprintf(fp, "+++%s !%ld %s\n", c_sum, (long int)lf->time, f_name);
     fflush(fp);
 
-    /* Alert if configured to notify on new files */
-    /* TODO: debugging this - Scott */
-    /* if ((Config.syscheck_alert_new == 1) && (DB_IsCompleted(agent_id))) { */
-    if (Config.syscheck_alert_new == 1)  {
+    /* Alert on new files only after the agent baseline is complete.
+     * The first scan (and rebuilds after syscheck_control -u) populate the
+     * DB without flooding rule 554; realtime/scheduled new files alert after
+     * HC_SK_DB_COMPLETED sets DB_IsCompleted.
+     */
+    if ((Config.syscheck_alert_new == 1) && (DB_IsCompleted(agent_id))) {
         sdb.syscheck_dec->id = sdb.idn;
 
         char *newfilec_sum = NULL;
