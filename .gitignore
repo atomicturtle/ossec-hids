@@ -107,6 +107,9 @@ testsuite/*.changes
 testsuite/*.buildinfo
 testsuite/*.tar.gz
 testsuite/*.tar.xz
+testsuite/e2e-linux/inventory.community.yaml
+testsuite/e2e-linux/mock-rocky10/
+testsuite/e2e-linux/.enroll.out
 
 # Pbuilder prepared source (generate_ossec.sh -d writes here)
 contrib/debian-packages/build/

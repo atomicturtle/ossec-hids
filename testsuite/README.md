@@ -84,3 +84,15 @@ make -f tests/regressions/Makefile check
 sid-list overflow free-safety, auth IPv6 key handling, and `os_queue` timedwait
 (used by the always-on analysisd pipeline). See
 [`src/tests/regressions/README.md`](../src/tests/regressions/README.md).
+
+### Linux install / upgrade / feature E2E
+
+Separate from compile containers: [`e2e-linux/`](e2e-linux/) drives real installs over **SSH** (community Rocky 10 server) or **Podman** systemd targets. See [`e2e-linux/README.md`](e2e-linux/README.md).
+
+```bash
+# Compile all distros, then E2E (E2E args required or E2E is skipped)
+./testsuite/run-all.sh --inventory testsuite/e2e-linux/inventory.community.yaml --backend ssh
+
+# E2E only
+./testsuite/e2e-linux/run.sh --inventory testsuite/e2e-linux/inventory.community.yaml
+```
