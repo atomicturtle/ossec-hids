@@ -390,13 +390,7 @@ int realtime_pending_ms(void)
     rt_pend *entry;
     unsigned long long best = 0;
     int have = 0;
-
-#ifdef WIN32
-    /* Keep the main loop tight while overflow recoveries remain. */
-    if (realtime_overflow_pending()) {
-        return (0);
-    }
-#endif
+    int ms;
 
     for (entry = rt_pend_head; entry != NULL; entry = entry->next) {
         unsigned long long left = rt_until(entry->due);
@@ -407,12 +401,21 @@ int realtime_pending_ms(void)
         }
     }
     if (!have) {
-        return (-1);
+        ms = -1;
+    } else if (best > 600000ULL) {
+        ms = 600000;
+    } else {
+        ms = (int)best;
     }
-    if (best > 600000ULL) {
-        return (600000);
+
+#ifdef WIN32
+    /* Wake soon for overflow recovery, but keep a small alertable wait
+     * so RTCallBack APCs can drain instead of busy-spinning the core. */
+    if (realtime_overflow_pending() && (ms < 0 || ms > 50)) {
+        ms = 50;
     }
-    return ((int)best);
+#endif
+    return (ms);
 }
 
 #ifdef WIN32
@@ -883,7 +886,8 @@ typedef struct _win32rtfim {
 
     char *dir;
     int opts;
-    TCHAR buffer[1228800];
+    /* Byte buffer for FILE_NOTIFY_INFORMATION (offsets are bytes). */
+    char buffer[1228800];
 } win32rtfim;
 
 int realtime_win32read(win32rtfim *rtlocald);
@@ -995,7 +999,7 @@ int realtime_win32read(win32rtfim *rtlocald)
 
     rc = ReadDirectoryChangesW(rtlocald->h,
                                rtlocald->buffer,
-                               sizeof(rtlocald->buffer) / sizeof(TCHAR),
+                               (DWORD)sizeof(rtlocald->buffer),
                                TRUE,
                                notify_filter,
                                0,
@@ -1062,9 +1066,9 @@ int realtime_adddir(const char *dir, int opts)
         return (0);
     }
 
-    /* Add final elements to the hash */
+    /* Add final elements to the hash (OSHash_Add copies the key). */
     os_strdup(dir, rtlocald->dir);
-    OSHash_Add(syscheck.realtime->dirtb, strdup(wdchar), rtlocald);
+    OSHash_Add(syscheck.realtime->dirtb, wdchar, rtlocald);
 
     /* Add directory to be monitored */
     realtime_win32read(rtlocald);
