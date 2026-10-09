@@ -23,6 +23,71 @@
 /* Global variables */
 static int __counter = 0;
 
+/* When set, any unreadable directory in this tree marks the walk incomplete
+ * so callers (overflow delete reconcile) can refuse mass-delete recovery.
+ * Single-threaded syscheck only: not re-entrant / not safe across threads. */
+static int read_dir_track_complete = 0;
+static int read_dir_incomplete = 0;
+/* Root of the current read_dir_complete() walk; used to skip nested
+ * configured directories that have their own opts/restrict. */
+static const char *read_dir_complete_root = NULL;
+
+/* path is under dir (case-insensitive; directory boundary aware). */
+static int c_path_under_dir(const char *path, const char *dir)
+{
+    size_t len;
+
+    if (path == NULL || dir == NULL || dir[0] == '\0') {
+        return (0);
+    }
+
+    len = strlen(dir);
+    while (len > 1 && (dir[len - 1] == '/' || dir[len - 1] == '\\')) {
+        len--;
+    }
+    if (strncasecmp(path, dir, len) != 0) {
+        return (0);
+    }
+    return (path[len] == '\0' || path[len] == '/' || path[len] == '\\');
+}
+
+/* True when a more-specific syscheck.dir owns path under the complete root. */
+static int c_nested_cfg_owns(const char *path)
+{
+    int i;
+    size_t root_len;
+
+    if (!read_dir_track_complete || read_dir_complete_root == NULL ||
+            path == NULL) {
+        return (0);
+    }
+
+    root_len = strlen(read_dir_complete_root);
+    while (root_len > 1 &&
+           (read_dir_complete_root[root_len - 1] == '/' ||
+            read_dir_complete_root[root_len - 1] == '\\')) {
+        root_len--;
+    }
+
+    for (i = 0; syscheck.dir && syscheck.dir[i]; i++) {
+        size_t len = strlen(syscheck.dir[i]);
+
+        while (len > 1 && (syscheck.dir[i][len - 1] == '/' ||
+                           syscheck.dir[i][len - 1] == '\\')) {
+            len--;
+        }
+        if (len <= root_len) {
+            continue;
+        }
+        if (!c_path_under_dir(syscheck.dir[i], read_dir_complete_root)) {
+            continue;
+        }
+        if (c_path_under_dir(path, syscheck.dir[i])) {
+            return (1);
+        }
+    }
+    return (0);
+}
 
 /* Read and generate the integrity data of a file */
 int read_file(const char *file_name, int opts, OSMatch *restriction)
@@ -86,9 +151,21 @@ int read_file(const char *file_name, int opts, OSMatch *restriction)
 
 #ifdef WIN32
         /* Directory links are not supported */
-        if (GetFileAttributes(file_name) & FILE_ATTRIBUTE_REPARSE_POINT) {
-            merror("%s: WARN: Links are not supported: '%s'", ARGV0, file_name);
-            return (-1);
+        {
+            DWORD attrs = GetFileAttributes(file_name);
+
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                if (read_dir_track_complete) {
+                    read_dir_incomplete = 1;
+                }
+                merror("%s: WARN: Unable to get attributes for '%s' (%lu).",
+                       ARGV0, file_name, (unsigned long)GetLastError());
+                return (-1);
+            }
+            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+                merror("%s: WARN: Links are not supported: '%s'", ARGV0, file_name);
+                return (-1);
+            }
         }
 #endif
         return (read_dir(file_name, opts, restriction));
@@ -672,17 +749,12 @@ int read_file(const char *file_name, int opts, OSMatch *restriction)
     return (0);
 }
 
-/* When set, any opendir failure in this tree marks the walk incomplete
- * so callers (overflow delete reconcile) can refuse mass-delete recovery.
- * Single-threaded syscheck only: not re-entrant / not safe across threads. */
-static int read_dir_track_complete = 0;
-static int read_dir_incomplete = 0;
-
 int read_dir(const char *dir_name, int opts, OSMatch *restriction)
 {
     size_t dir_size;
     char f_name[PATH_MAX + 2];
     short is_nfs;
+    int open_errno;
 
     DIR *dp;
     struct dirent *entry;
@@ -716,7 +788,9 @@ int read_dir(const char *dir_name, int opts, OSMatch *restriction)
     /* Open the directory given */
     dp = opendir(dir_name);
     if (!dp) {
-        if (errno == ENOTDIR) {
+        open_errno = errno;
+
+        if (open_errno == ENOTDIR) {
             if (read_file(dir_name, opts, restriction) == 0) {
                 return (0);
             }
@@ -742,14 +816,20 @@ int read_dir(const char *dir_name, int opts, OSMatch *restriction)
 
         if (defaultfilesn[di] == NULL) {
             merror("%s: WARN: Error opening directory: '%s': %s ",
-                   ARGV0, dir_name, strerror(errno));
+                   ARGV0, dir_name, strerror(open_errno));
         }
 #else
         merror("%s: WARN: Error opening directory: '%s': %s ",
                ARGV0,
                dir_name,
-               strerror(errno));
+               strerror(open_errno));
 #endif /* WIN32 */
+        /* ENOENT/ENOTDIR: directory is gone or replaced — enumeration of
+         * this node is complete; delete reconcile can cover its children.
+         * EACCES/EIO/etc. may still hide existing files. */
+        if (open_errno == ENOENT || open_errno == ENOTDIR) {
+            return (0);
+        }
         if (read_dir_track_complete) {
             read_dir_incomplete = 1;
         }
@@ -775,6 +855,7 @@ int read_dir(const char *dir_name, int opts, OSMatch *restriction)
         /* Ignore . and ..  */
         if ((strcmp(entry->d_name, ".") == 0) ||
                 (strcmp(entry->d_name, "..") == 0)) {
+            errno = 0;
             continue;
         }
 
@@ -790,6 +871,13 @@ int read_dir(const char *dir_name, int opts, OSMatch *restriction)
         *s_name = '\0';
         strncpy(s_name, entry->d_name, PATH_MAX - dir_size - 2);
 
+        /* Nested configured directories use their own opts/restrict; leave
+         * them to their own overflow recovery instead of this walk. */
+        if (c_nested_cfg_owns(f_name)) {
+            errno = 0;
+            continue;
+        }
+
         /* Check if the file is a directory */
         if(opts & CHECK_NORECURSE) {
             struct stat recurse_sb;
@@ -798,6 +886,7 @@ int read_dir(const char *dir_name, int opts, OSMatch *restriction)
             } else {
                 switch (recurse_sb.st_mode & S_IFMT) {
                     case S_IFDIR:
+                        errno = 0;
                         continue;
                         break;
                 }
@@ -834,7 +923,9 @@ int read_dir_complete(const char *dir_name, int opts, OSMatch *restriction)
 
     read_dir_track_complete = 1;
     read_dir_incomplete = 0;
+    read_dir_complete_root = dir_name;
     rc = read_dir(dir_name, opts, restriction);
+    read_dir_complete_root = NULL;
     read_dir_track_complete = 0;
 
     if (rc != 0 || read_dir_incomplete) {

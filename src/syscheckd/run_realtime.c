@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <limits.h>
@@ -421,16 +422,32 @@ int realtime_pending_ms(void)
 #ifdef WIN32
 /* Overflow recovery is deferred out of RTCallBack so the alertable wait
  * thread is not blocked on a recursive read_dir. Duplicate watches for
- * the same directory are coalesced. */
+ * the same directory are coalesced. FIFO so a hot head cannot starve
+ * sibling watches forever. */
 typedef struct _rt_ovf {
     struct _rt_ovf *next;
     char *dir;
     int opts;
     int cfg; /* best-matching syscheck.dir index, or -1 */
+    int attempts;
 } rt_ovf;
 
 static rt_ovf *rt_ovf_head = NULL;
+static rt_ovf *rt_ovf_tail = NULL;
 static OSHash *rt_ovf_hash = NULL;
+
+#define RT_OVF_MAX_ATTEMPTS 8
+
+static void rt_ovf_append(rt_ovf *entry)
+{
+    entry->next = NULL;
+    if (rt_ovf_tail != NULL) {
+        rt_ovf_tail->next = entry;
+    } else {
+        rt_ovf_head = entry;
+    }
+    rt_ovf_tail = entry;
+}
 
 static int rt_path_under_dir(const char *path, const char *dir)
 {
@@ -509,6 +526,9 @@ static void rt_ovf_unlink(rt_ovf *target)
                 prev->next = curr->next;
             } else {
                 rt_ovf_head = curr->next;
+            }
+            if (rt_ovf_tail == curr) {
+                rt_ovf_tail = prev;
             }
             if (rt_ovf_hash != NULL) {
                 OSHash_Delete(rt_ovf_hash, curr->dir);
@@ -589,13 +609,48 @@ static void rt_overflow_schedule(const char *dir, int opts)
     os_strdup(dir, entry->dir);
     entry->opts = opts;
     entry->cfg = cfg;
+    entry->attempts = 0;
     if (OSHash_Add(rt_ovf_hash, entry->dir, entry) != 2) {
         free(entry->dir);
         free(entry);
         return;
     }
-    entry->next = rt_ovf_head;
-    rt_ovf_head = entry;
+    rt_ovf_append(entry);
+}
+
+/* True when a more-specific configured directory owns path under dir. */
+static int rt_nested_cfg_owns(const char *path, const char *dir)
+{
+    int i;
+    size_t dir_len;
+
+    if (path == NULL || dir == NULL) {
+        return (0);
+    }
+
+    dir_len = strlen(dir);
+    while (dir_len > 1 && (dir[dir_len - 1] == '/' || dir[dir_len - 1] == '\\')) {
+        dir_len--;
+    }
+
+    for (i = 0; syscheck.dir && syscheck.dir[i]; i++) {
+        size_t len = strlen(syscheck.dir[i]);
+
+        while (len > 1 && (syscheck.dir[i][len - 1] == '/' ||
+                           syscheck.dir[i][len - 1] == '\\')) {
+            len--;
+        }
+        if (len <= dir_len) {
+            continue;
+        }
+        if (!rt_path_under_dir(syscheck.dir[i], dir)) {
+            continue;
+        }
+        if (rt_path_under_dir(path, syscheck.dir[i])) {
+            return (1);
+        }
+    }
+    return (0);
 }
 
 /* Queue cached paths under dir that are gone so realtime_pending_process
@@ -611,8 +666,14 @@ static void rt_overflow_queue_missing(const char *dir)
 
     for (i = 0; i <= syscheck.fp->rows; i++) {
         for (curr = syscheck.fp->table[i]; curr != NULL; curr = curr->next) {
-            if (curr->key != NULL && rt_path_under_dir(curr->key, dir) &&
-                    rt_path_missing(curr->key)) {
+            if (curr->key == NULL || !rt_path_under_dir(curr->key, dir)) {
+                continue;
+            }
+            /* Nested configured trees are reconciled by their own recovery. */
+            if (rt_nested_cfg_owns(curr->key, dir)) {
+                continue;
+            }
+            if (rt_path_missing(curr->key)) {
                 realtime_enqueue(curr->key);
             }
         }
@@ -636,10 +697,17 @@ static void realtime_overflow_process(void)
     }
 
     rt_ovf_head = entry->next;
+    if (rt_ovf_head == NULL) {
+        rt_ovf_tail = NULL;
+    }
+    entry->next = NULL;
     OSHash_Delete(rt_ovf_hash, entry->dir);
-    scan_opts = entry->opts & ~CHECK_REALTIME;
+    /* Watches request subtree notifications; recover the full subtree even
+     * when the configured directory has check_norecurse. */
+    scan_opts = entry->opts & ~CHECK_REALTIME & ~CHECK_NORECURSE;
     if (entry->cfg >= 0 && syscheck.dir && syscheck.dir[entry->cfg]) {
-        scan_opts = syscheck.opts[entry->cfg] & ~CHECK_REALTIME;
+        scan_opts = syscheck.opts[entry->cfg] & ~CHECK_REALTIME &
+                    ~CHECK_NORECURSE;
         restriction = syscheck.filerestrict[entry->cfg];
     }
 
@@ -648,13 +716,31 @@ static void realtime_overflow_process(void)
      * delete of every cached child. */
     if (read_dir_complete(entry->dir, scan_opts, restriction) == 0) {
         rt_overflow_queue_missing(entry->dir);
-    } else {
-        merror("%s: WARN: overflow recovery scan of '%s' incomplete; "
-               "skipping delete reconciliation.", ARGV0, entry->dir);
+        free(entry->dir);
+        free(entry);
+        return;
     }
 
-    free(entry->dir);
-    free(entry);
+    entry->attempts++;
+    if (entry->attempts >= RT_OVF_MAX_ATTEMPTS) {
+        merror("%s: WARN: overflow recovery scan of '%s' incomplete after "
+               "%d attempts; giving up (delete reconciliation skipped).",
+               ARGV0, entry->dir, entry->attempts);
+        free(entry->dir);
+        free(entry);
+        return;
+    }
+
+    merror("%s: WARN: overflow recovery scan of '%s' incomplete; "
+           "retrying (attempt %d/%d).",
+           ARGV0, entry->dir, entry->attempts, RT_OVF_MAX_ATTEMPTS);
+    if (OSHash_Add(rt_ovf_hash, entry->dir, entry) != 2) {
+        free(entry->dir);
+        free(entry);
+        return;
+    }
+    /* Append so a hot directory that fails again cannot starve siblings. */
+    rt_ovf_append(entry);
 }
 
 static int realtime_overflow_pending(void)
@@ -922,33 +1008,55 @@ void CALLBACK RTCallBack(DWORD dwerror, DWORD dwBytes, LPOVERLAPPED overlap)
         return;
     }
 
-    /* Overflow is ERROR_NOTIFY_ENUM_DIR, or a successful completion with
-     * no bytes. Failed completions also report dwBytes==0 — do not treat
-     * those as overflow (would re-arm and spin the APC). */
+    /* Overflow: ERROR_NOTIFY_ENUM_DIR / ERROR_MORE_DATA, or a successful
+     * completion with no bytes. Failed completions also report dwBytes==0
+     * — do not treat those as overflow (would re-arm and spin the APC). */
     if (dwerror == ERROR_NOTIFY_ENUM_DIR ||
+            dwerror == ERROR_MORE_DATA ||
             (dwerror == ERROR_SUCCESS && dwBytes == 0)) {
         merror("%s: ERROR: real time buffer overflow on '%s' (error %lu).",
                ARGV0, rtlocald->dir, (unsigned long)dwerror);
-        realtime_win32read(rtlocald);
-        /* Defer enumeration + delete reconcile to the main loop so this
-         * APC does not block other watches (and so repeats coalesce). */
+        /* Re-arm without sleeping in this APC; recovery is deferred. */
+        (void)realtime_win32read(rtlocald);
+        rt_overflow_schedule(rtlocald->dir, rtlocald->opts);
+        return;
+    }
+
+    if (dwerror == ERROR_ACCESS_DENIED ||
+            dwerror == ERROR_NETNAME_DELETED ||
+            dwerror == ERROR_BAD_NETPATH) {
+        /* Directory removed / ACL / share drop: try re-arm, always recover. */
+        merror("%s: ERROR: real time watch error %lu on '%s'; recovering.",
+               ARGV0, (unsigned long)dwerror, rtlocald->dir);
+        (void)realtime_win32read(rtlocald);
         rt_overflow_schedule(rtlocald->dir, rtlocald->opts);
         return;
     }
 
     if (dwerror != ERROR_SUCCESS) {
-        /* Unknown failure: do not re-arm (avoids an APC spin). */
+        /* Unknown failure: do not re-arm (avoids an APC spin), but still
+         * attempt one deferred recovery for events lost with the watch. */
         merror("%s: ERROR: real time call back error %lu on '%s'.",
                ARGV0, (unsigned long)dwerror, rtlocald->dir);
+        rt_overflow_schedule(rtlocald->dir, rtlocald->opts);
         return;
     }
 
-    do {
+    while (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) <= dwBytes) {
+        size_t name_bytes;
+        size_t next;
+
         pinfo = (PFILE_NOTIFY_INFORMATION) &rtlocald->buffer[offset];
-        offset += pinfo->NextEntryOffset;
+        name_bytes = (size_t)pinfo->FileNameLength;
+        if (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) + name_bytes >
+                dwBytes) {
+            merror("%s: ERROR: real time notify record truncated on '%s'.",
+                   ARGV0, rtlocald->dir);
+            break;
+        }
 
         lcount = WideCharToMultiByte(CP_ACP, 0, pinfo->FileName,
-                                     pinfo->FileNameLength / sizeof(WCHAR),
+                                     (int)(name_bytes / sizeof(WCHAR)),
                                      finalfile, MAX_PATH - 1, NULL, NULL);
         finalfile[lcount] = TEXT('\0');
 
@@ -963,9 +1071,23 @@ void CALLBACK RTCallBack(DWORD dwerror, DWORD dwBytes, LPOVERLAPPED overlap)
         /* Queue the change. A locked truncate must be retried after
          * this callback returns; closing the file is not a new event. */
         realtime_enqueue(final_path);
-    } while (pinfo->NextEntryOffset != 0);
 
-    realtime_win32read(rtlocald);
+        next = (size_t)pinfo->NextEntryOffset;
+        if (next == 0) {
+            break;
+        }
+        if (next < offsetof(FILE_NOTIFY_INFORMATION, FileName) ||
+                offset + next > dwBytes) {
+            merror("%s: ERROR: real time notify chain corrupt on '%s'.",
+                   ARGV0, rtlocald->dir);
+            break;
+        }
+        offset += next;
+    }
+
+    if (realtime_win32read(rtlocald) != 0) {
+        rt_overflow_schedule(rtlocald->dir, rtlocald->opts);
+    }
 
     return;
 }
@@ -1006,9 +1128,10 @@ int realtime_win32read(win32rtfim *rtlocald)
                                &rtlocald->overlap,
                                RTCallBack);
     if (rc == 0) {
+        /* Do not sleep here: this runs from an APC and must return quickly. */
         merror("%s: ERROR: Unable to set directory for monitoring: %s",
                ARGV0, rtlocald->dir);
-        sleep(2);
+        return (-1);
     }
 
     return (0);
@@ -1071,7 +1194,13 @@ int realtime_adddir(const char *dir, int opts)
     OSHash_Add(syscheck.realtime->dirtb, wdchar, rtlocald);
 
     /* Add directory to be monitored */
-    realtime_win32read(rtlocald);
+    if (realtime_win32read(rtlocald) != 0) {
+        OSHash_Delete(syscheck.realtime->dirtb, wdchar);
+        CloseHandle(rtlocald->h);
+        free(rtlocald->dir);
+        free(rtlocald);
+        return (0);
+    }
 
     return (1);
 }
